@@ -1,13 +1,13 @@
 # Clear-CitrixIdleSessions.ps1
-# Logs off idle/disconnected Citrix sessions after a configurable time threshold
+# Logs off idle/disconnected Citrix sessions after a configurable time threshold.
 # Requires: Citrix.Broker.Admin.V2 snap-in
 # Run as Administrator
-# WARNING: This script terminates sessions. Use with caution.
+# WARNING: This script terminates sessions. Use -WhatIf for a dry run.
 
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param (
     [int]$IdleMinutes = 120,        # Default: 2 hours
-    [switch]$DisconnectedOnly,      # Only clear disconnected sessions
-    [switch]$WhatIf                  # Show what would be done without actually logging off
+    [switch]$DisconnectedOnly       # Only clear disconnected sessions
 )
 
 Write-Host "===== Citrix Idle Session Cleanup =====" -ForegroundColor Cyan
@@ -18,7 +18,7 @@ if ($DisconnectedOnly) {
 } else {
     Write-Host "Mode: Disconnected + Idle sessions" -ForegroundColor Yellow
 }
-if ($WhatIf) {
+if ($WhatIfPreference) {
     Write-Host "Mode: DRY RUN - No sessions will be terminated" -ForegroundColor Magenta
 }
 Write-Host ""
@@ -33,58 +33,90 @@ try {
 } catch {
     Write-Host "Error: Citrix.Broker.Admin.V2 snap-in not found." -ForegroundColor Red
     Write-Host "Make sure this script runs on a Citrix Delivery Controller." -ForegroundColor Yellow
-    exit
+    return
 }
 
 try {
     $now = Get-Date
     $threshold = $now.AddMinutes(-$IdleMinutes)
-    
+
     Write-Host "--- Analyzing Sessions ---" -ForegroundColor Yellow
-    
-    # Get all disconnected sessions
-    $disconnectedSessions = Get-BrokerSession -Filter @{ SessionState = "Disconnected" } -ErrorAction SilentlyContinue
-    
-    # Get all idle sessions (connected but idle)
-    $idleSessions = Get-BrokerSession -Filter @{ SessionState = "Connected" } -ErrorAction SilentlyContinue | 
-        Where-Object { $_.DisconnectTime -lt $threshold }
-    
+
+    # Disconnected sessions older than the threshold.
+    # DisconnectTime is the moment the session was disconnected.
+    $disconnectedSessions = @(
+        Get-BrokerSession -Filter { SessionState -eq 'Disconnected' } -ErrorAction SilentlyContinue |
+            Where-Object { $_.SessionStateChangeTime -ne $null -and $_.SessionStateChangeTime -lt $threshold }
+    )
+
+    # Idle (Connected) sessions: idle time is measured from the last user input,
+    # which lives on $_.SessionInfo or, on older SDKs, can be approximated with
+    # SessionStateChangeTime. We deliberately do NOT use DisconnectTime for
+    # connected sessions because it is null and "$null -lt [datetime]" is $true,
+    # which would match every active session.
+    $idleSessions = @()
+    if (-not $DisconnectedOnly) {
+        $idleSessions = @(
+            Get-BrokerSession -Filter { SessionState -eq 'Active' } -ErrorAction SilentlyContinue |
+                Where-Object {
+                    # Prefer the explicit IdleSince/IdleTime if present, else
+                    # fall back to the last session-state change.
+                    $idleSince = $null
+                    if ($_.PSObject.Properties.Name -contains 'IdleSince' -and $_.IdleSince) {
+                        $idleSince = $_.IdleSince
+                    } elseif ($_.SessionStateChangeTime) {
+                        $idleSince = $_.SessionStateChangeTime
+                    }
+                    $idleSince -ne $null -and $idleSince -lt $threshold
+                }
+        )
+    }
+
     # Combine sessions based on mode
     if ($DisconnectedOnly) {
         $sessionsToClear = $disconnectedSessions
     } else {
-        $sessionsToClear = @($disconnectedSessions + $idleSessions) | Sort-Object -Unique -Property Id
+        $sessionsToClear = @($disconnectedSessions + $idleSessions) | Sort-Object -Unique -Property Uid
     }
-    
-    if ($sessionsToClear) {
+
+    if ($sessionsToClear -and $sessionsToClear.Count -gt 0) {
         $count = $sessionsToClear.Count
         Write-Host "Found $count sessions exceeding the idle threshold." -ForegroundColor Red
         Write-Host ""
         Write-Host "--- Sessions to be Cleared ---" -ForegroundColor Yellow
-        
+
         foreach ($sess in $sessionsToClear) {
-            $idleTime = $now - $sess.DisconnectTime
+            $referenceTime = if ($sess.SessionState -eq 'Disconnected') { $sess.SessionStateChangeTime }
+                             elseif ($sess.PSObject.Properties.Name -contains 'IdleSince' -and $sess.IdleSince) { $sess.IdleSince }
+                             else { $sess.SessionStateChangeTime }
+
+            $idleStr = "n/a"
+            if ($referenceTime) {
+                $idleTime = $now - $referenceTime
+                $idleStr  = "{0}h {1}m" -f [int]$idleTime.TotalHours, $idleTime.Minutes
+            }
+
             $user = $sess.UserName
-            $appName = $sess.ApplicationName
-            $dg = $sess.DesktopGroupName
-            $idleStr = "{0}h {1}m" -f $idleTime.Hours, $idleTime.Minutes
-            
-            Write-Host "  User: $user | App: $appName | Group: $dg | Idle: $idleStr" -ForegroundColor Red
-            
-            if (-not $WhatIf) {
+            $dg   = $sess.DesktopGroupName
+            $st   = $sess.SessionState
+
+            Write-Host "  User: $user | State: $st | Group: $dg | Idle: $idleStr" -ForegroundColor Red
+
+            $target = "Citrix session Uid=$($sess.Uid) (User=$user, State=$st)"
+            if ($PSCmdlet.ShouldProcess($target, "Stop-BrokerSession (log off)")) {
                 try {
-                    Stop-BrokerSession -Id $sess.Id -ErrorAction Stop
+                    Stop-BrokerSession -InputObject $sess -ErrorAction Stop
                     Write-Host "  -> Session logged off successfully." -ForegroundColor Green
                 } catch {
                     Write-Host "  -> Failed to log off: $($_.Exception.Message)" -ForegroundColor DarkYellow
                 }
             }
         }
-        
-        if ($WhatIf) {
+
+        if ($WhatIfPreference) {
             Write-Host "`nDRY RUN complete. $count sessions would have been logged off." -ForegroundColor Magenta
         } else {
-            Write-Host "`nCleanup complete. $count sessions were logged off." -ForegroundColor Green
+            Write-Host "`nCleanup complete. Processed $count sessions." -ForegroundColor Green
         }
     } else {
         Write-Host "No sessions exceed the idle threshold. Nothing to clear." -ForegroundColor Green
@@ -92,5 +124,5 @@ try {
 
 } catch {
     Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
-    exit
+    return
 }
